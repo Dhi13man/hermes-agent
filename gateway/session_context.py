@@ -59,11 +59,16 @@ _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", de
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# The running cron job and its fire-claim owner, exported to the run's tool subprocesses so a
+# `hermes cron remove` the run makes on its own job is recognised as the run's own request.
+_CRON_JOB_ID = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_FIRE_OWNER = ContextVar("HERMES_CRON_FIRE_OWNER", default=_UNSET)
+
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
     *_SESSION_VARS, _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
-    _CRON_AUTO_DELIVER_THREAD_ID,
+    _CRON_AUTO_DELIVER_THREAD_ID, _CRON_JOB_ID, _CRON_FIRE_OWNER,
 )}
 
 

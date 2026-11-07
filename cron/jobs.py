@@ -135,37 +135,6 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
     "cron_store_override", default=None)
 
 
-class _SelfRemovalDelivery:
-    """Mutable run-local marker shared with the agent's copied ContextVar context."""
-
-    def __init__(self, job_id: str):
-        self.job_id = job_id
-        self.removed = False
-
-
-_self_removal_delivery: ContextVar[Optional[_SelfRemovalDelivery]] = ContextVar(
-    "self_removal_delivery", default=None)
-
-
-@contextlib.contextmanager
-def self_removal_delivery_scope(job_id: str):
-    """Permit this run's final delivery after it removes its own job record."""
-    marker = _SelfRemovalDelivery(job_id)
-    token = _self_removal_delivery.set(marker)
-    try:
-        yield marker
-    finally:
-        _self_removal_delivery.reset(token)
-
-
-def self_removal_delivery_allowed(job_id: str) -> bool:
-    """Whether the active run deleted exactly its own job record and no record has since taken
-    its id (a replacement record belongs to another owner, so that stays fail-closed)."""
-    marker = _self_removal_delivery.get()
-    if marker is None or marker.job_id != job_id or not marker.removed:
-        return False
-    return all(item.get("id") != job_id for item in load_jobs())
-
 # Import-time snapshot so deliberate re-pointing of CRON_DIR/JOBS_FILE/OUTPUT_DIR (the documented
 # escape hatch for tests/embedders) is distinguishable from the constants merely being stale.
 _IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
@@ -408,8 +377,8 @@ def _under_fire_fence(job_id: str, fn: Callable[[], Any]) -> Any:
 
 @contextlib.contextmanager
 def fire_claim_fence(job_id: str, *, expected_owner: str):
-    """Hold a per-job fence while an owner performs an external side effect. A missing record
-    is accepted only for the active run that removed this exact job (#111039)."""
+    """Hold a per-job fence while an owner performs an external side effect; True only while
+    *expected_owner* still holds the job's fire claim."""
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             yield False
@@ -418,8 +387,6 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             job = next((item for item in load_jobs() if item.get("id") == job_id), None)
             claim = job.get("fire_claim") if isinstance(job, dict) else None
             owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
-            if job is None:
-                owns_claim = self_removal_delivery_allowed(job_id)
         yield owns_claim
 
 
@@ -2304,38 +2271,58 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
     return _with_job(job_ref["id"], apply)
 
 
+def _is_own_run_request(job: dict[str, Any]) -> bool:
+    """Whether the caller is the run holding *job*'s live fire claim. The run's in-process tools
+    read its ContextVars and its terminal subprocesses inherit them as env (``_CronRunScope``)."""
+    from gateway.session_context import get_session_env
+
+    owner = get_session_env("HERMES_CRON_FIRE_OWNER")
+    claim = job.get("fire_claim")
+    return (
+        bool(owner) and get_session_env("HERMES_CRON_JOB_ID") == job.get("id")
+        and isinstance(claim, dict) and claim.get("by") == owner)
+
+
+def _discard_job_files(job_id: str) -> None:
+    """Delete a removed job's output directory, notepad and fire-fence registry entry."""
+    job_output_dir = _job_output_dir(job_id)
+    if job_output_dir.exists():
+        shutil.rmtree(job_output_dir)
+    try:
+        from cron.notepad import clear_notepad
+        clear_notepad(job_id)
+    except Exception:
+        logger.debug("Failed to clear notepad for removed job %s", job_id, exc_info=True)
+    # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
+    _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{job_id}"
+    with _fire_fence_locks_guard:
+        _fire_fence_locks.pop(_fence_key, None)
+
+
 def remove_job(job_id: str) -> bool:
-    """Remove a job by ID or name."""
+    """Remove a job by ID or name. A run removing its own job only stamps ``remove_after_run``:
+    its final delivery needs the record and fire claim, and ``mark_job_run`` deletes the record
+    once that run completes. Anyone else's removal deletes now and stops the live run."""
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
+    # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
+    _job_output_dir(canonical_id)
     with _jobs_lock():
         jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) == original_len:
+        current = next((j for j in jobs if j["id"] == canonical_id), None)
+        if current is None:
             return False
-        # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
-        job_output_dir = _job_output_dir(canonical_id)
-        save_jobs(jobs, removed_ids={canonical_id})
-        marker = _self_removal_delivery.get()
-        if marker is not None and marker.job_id == canonical_id:
-            marker.removed = True
-        else:  # someone else removed it: its live run must stop, not burn tokens to a discard
-            cancel_job_run(canonical_id, reason="job removed while running")
-        if job_output_dir.exists():
-            shutil.rmtree(job_output_dir)
-        try:
-            from cron.notepad import clear_notepad
-            clear_notepad(canonical_id)
-        except Exception:
-            logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
-        # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
-        _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
-        with _fire_fence_locks_guard:
-            _fire_fence_locks.pop(_fence_key, None)
-        return True
+        if _is_own_run_request(current):
+            current["remove_after_run"] = True
+            save_jobs(jobs)
+            return True
+        save_jobs([j for j in jobs if j["id"] != canonical_id], removed_ids={canonical_id})
+        # Someone else removed it: its live run must stop, not burn tokens to a discard.
+        cancel_job_run(canonical_id, reason="job removed while running")
+    _discard_job_files(canonical_id)
+    return True
 
 
 def cancel_job_run(job_id: str, reason: Optional[str] = None) -> dict[str, Any]:
@@ -2516,8 +2503,14 @@ def mark_job_run(
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
     (cron/quota_hold.py, #89376).
+
+    A record stamped ``remove_after_run`` (the run removed its own job, see ``remove_job``) is
+    deleted here instead of updated.
     """
-    def apply(jobs, _i, job):
+    removed = False
+
+    def apply(jobs, i, job):
+        nonlocal removed
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
             return True
         if expected_fire_owner is not None:
@@ -2527,6 +2520,11 @@ def mark_job_run(
                     "mark_job_run: job_id %s fire claim owner changed; discarding stale completion",
                     job_id)
                 return False
+        if job.get("remove_after_run"):
+            jobs.pop(i)
+            save_jobs(jobs, removed_ids={job_id})
+            removed = True
+            return True
         now = _hermes_now().isoformat()
         extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
         held = extra_fire.held_markers(job) if extra else {}
@@ -2561,7 +2559,10 @@ def mark_job_run(
             return False
         return found
 
-    return _under_fire_fence(job_id, locked)
+    marked = _under_fire_fence(job_id, locked)
+    if removed:
+        _discard_job_files(job_id)
+    return marked
 
 
 def claim_dispatch(job_id: str) -> bool:

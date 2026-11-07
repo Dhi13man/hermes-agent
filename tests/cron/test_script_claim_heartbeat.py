@@ -2,6 +2,10 @@
 
 from datetime import datetime, timedelta, timezone
 import contextlib
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -369,13 +373,18 @@ def _run_claimed_job_with_mid_run_action(
     expect_result=True,
 ):
     """Fire a claimed job through run_one_job with a stubbed agent run that performs ``mid_run``
-    on its own record, keeps working past one fire-claim heartbeat tick, then completes (or
-    raises ``crash``)."""
+    on its own record inside the real per-run scope (the context its tools see), keeps working
+    past one fire-claim heartbeat tick, then completes (or raises ``crash``)."""
     from cron import jobs
     from cron import scheduler
 
     def _run_job(job, **_kwargs):
-        mid_run(jobs, job)
+        scope = scheduler._CronRunScope(job, job["id"], job.get("execution_id"))
+        scope.enter()
+        try:
+            mid_run(jobs, job)
+        finally:
+            scope.exit()
         time.sleep(0.3)
         if crash is not None:
             raise crash
@@ -453,42 +462,112 @@ def test_self_removed_job_leaves_no_output_directory(tmp_path, monkeypatch):
     assert list((tmp_path / "cron" / "output").glob("*")) == []
 
 
-def test_self_removed_job_crash_skips_mark_job_run(tmp_path, monkeypatch):
-    """A run that crashes after removing its own record has no record to mark: the crash path
-    must skip mark_job_run like the completion path does, not probe a missing record."""
-    from cron import scheduler
+def test_self_removed_job_crash_still_removes_the_record(tmp_path, monkeypatch):
+    """A run that crashes after asking to remove its own job books the crash and the removal
+    still lands: the crash path's mark_job_run applies it."""
+    from cron import jobs
 
-    marked = MagicMock(return_value=True)
-    monkeypatch.setattr(scheduler, "mark_job_run", marked)
     _delivered, finished = _run_claimed_job_with_mid_run_action(
         tmp_path, monkeypatch,
         lambda jobs_mod, job: jobs_mod.remove_job(job["id"]),
         execution_id="self-removal-crash-execution",
         crash=RuntimeError("boom after self-removal"), expect_result=False)
 
-    marked.assert_not_called()
     finished.assert_called_once_with(
         "self-removal-crash-execution", success=False,
         error="boom after self-removal", delivery_outcome="delivered")
+    with jobs.use_cron_store(tmp_path):
+        assert jobs.load_jobs() == []
 
 
-def test_self_removal_followed_by_replacement_record_stays_fail_closed(tmp_path, monkeypatch):
-    """Self-removal only excuses a MISSING record: once another owner's record reclaims the id,
-    the run is stale again and its result must be discarded, never delivered."""
+def test_self_removal_then_claim_takeover_stays_fail_closed(tmp_path, monkeypatch):
+    """A run's own removal request does not excuse a lost claim: once another owner takes the
+    fire claim, the run is stale and its result must be discarded, never delivered."""
 
-    def _remove_then_replace(jobs_mod, job):
+    def _remove_then_take_over(jobs_mod, job):
         assert jobs_mod.remove_job(job["id"])
-        replacement = {k: v for k, v in job.items() if k != "execution_id"}
-        replacement["fire_claim"] = {"at": job["fire_claim"]["at"], "by": "other-machine:owner"}
-        jobs_mod.save_jobs(jobs_mod.load_jobs() + [replacement])
+        stored = jobs_mod.load_jobs()
+        stored[0]["fire_claim"] = {"at": job["fire_claim"]["at"], "by": "other-machine:owner"}
+        jobs_mod.save_jobs(stored)
 
     delivered, finished = _run_claimed_job_with_mid_run_action(
-        tmp_path, monkeypatch, _remove_then_replace, execution_id="replacement-execution")
+        tmp_path, monkeypatch, _remove_then_take_over, execution_id="replacement-execution")
 
     delivered.assert_not_called()
     finished.assert_called_once_with(
         "replacement-execution", success=False,
         error="Fire claim ownership lost; stale result was discarded.")
+
+
+def _hermes_cron_cli(home, *args, run_identity):
+    """Run ``hermes cron <args>`` as a real child process against *home*'s store. With
+    ``run_identity`` the env is built the way the terminal tool builds a spawned command's, so
+    the child carries the calling run's identity; without it the child is an unrelated process."""
+    from tools.environments.local import _finalize_child_env
+
+    env = _finalize_child_env(dict(os.environ)) if run_identity else {
+        k: v for k, v in os.environ.items() if not k.startswith("HERMES_CRON_")}
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    done = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "cron", *args],
+        env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_run_removing_its_job_from_its_terminal_still_delivers(tmp_path, monkeypatch):
+    """`hermes cron remove <own id>` from the run's terminal (a subprocess, so no in-process
+    state) must not interrupt the run: its final response is delivered, then the job is gone."""
+    from cron import jobs
+
+    delivered, finished = _run_claimed_job_with_mid_run_action(
+        tmp_path, monkeypatch,
+        lambda _jobs, job: _hermes_cron_cli(tmp_path, "remove", job["id"], run_identity=True),
+        execution_id="cli-self-removal-execution", stub_output=False)
+
+    delivered.assert_called_once()
+    finished.assert_called_once_with(
+        "cli-self-removal-execution", success=True, error=None, delivery_outcome="delivered")
+    with jobs.use_cron_store(tmp_path):
+        assert jobs.load_jobs() == []
+    assert list((tmp_path / "cron" / "output").glob("*")) == []
+
+
+def test_job_removed_by_another_process_still_interrupts_the_run(tmp_path, monkeypatch):
+    """Removal by a process that is not the run deletes the job at once; the run is stale and
+    its result is discarded."""
+    from cron import jobs
+
+    delivered, finished = _run_claimed_job_with_mid_run_action(
+        tmp_path, monkeypatch,
+        lambda _jobs, job: _hermes_cron_cli(tmp_path, "remove", job["id"], run_identity=False),
+        execution_id="foreign-removal-execution")
+
+    delivered.assert_not_called()
+    finished.assert_called_once_with(
+        "foreign-removal-execution", success=False,
+        error="Fire claim ownership lost; stale result was discarded.")
+    with jobs.use_cron_store(tmp_path):
+        assert jobs.load_jobs() == []
+
+
+def test_run_pausing_its_job_from_its_terminal_still_delivers(tmp_path, monkeypatch):
+    """`hermes cron pause <own id>` from the run's terminal keeps the run's delivery, and the job
+    stays paused after the run's bookkeeping."""
+    from cron import jobs
+
+    delivered, finished = _run_claimed_job_with_mid_run_action(
+        tmp_path, monkeypatch,
+        lambda _jobs, job: _hermes_cron_cli(tmp_path, "pause", job["id"], run_identity=True),
+        execution_id="cli-self-pause-execution")
+
+    delivered.assert_called_once()
+    finished.assert_called_once_with(
+        "cli-self-pause-execution", success=True, error=None, delivery_outcome="delivered")
+    with jobs.use_cron_store(tmp_path):
+        (job,) = jobs.load_jobs()
+    assert job["enabled"] is False and job["state"] == "paused"
+    assert job["fire_claim"] is None
 
 
 def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatch):

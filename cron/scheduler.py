@@ -522,7 +522,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    save_job_output, use_cron_store)
 from cron import store_health
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
@@ -2363,6 +2363,12 @@ class _CronRunScope:
         )
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")
+        # Run identity for tool subprocesses: cron.jobs.remove_job defers a removal made by this
+        # run (in-process tool or `hermes cron remove` in its terminal) until the run finishes.
+        claim = job.get("fire_claim")
+        _VAR_MAP["HERMES_CRON_JOB_ID"].set(job_id)
+        _VAR_MAP["HERMES_CRON_FIRE_OWNER"].set(
+            str(claim.get("by") or "") if isinstance(claim, dict) else "")
         # Workdir binds to the per-run task id (tool-layer cwd authority) instead of mutating
         # global TERMINAL_CWD; _SESSION_CWD above remains the prompt/context-file authority.
         self.task_id = f"cron:{job_id}:{execution_id or job.get('execution_id') or uuid.uuid4().hex}"
@@ -2399,7 +2405,7 @@ class _CronRunScope:
         if self._spend_token is not None:
             from tools.mcp_tool_costs import unbind_run
             unbind_run(self._spend_token)
-        for name in _CRON_DELIVERY_VARS:
+        for name in (*_CRON_DELIVERY_VARS, "HERMES_CRON_JOB_ID", "HERMES_CRON_FIRE_OWNER"):
             self._var_map[name].set("")
 
 
@@ -2750,9 +2756,6 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
-                    if self_removal_delivery_allowed(job_id):
-                        # Record dropped by this run; nothing left to keep fresh.
-                        continue
                     # One miss is a sample, not a verdict (#113357): a latch cancels the live
                     # agent run and ends the lease refresh, so confirm before acting on it.
                     if stop.wait(_FIRE_CLAIM_MISS_CONFIRM_SECONDS) or heartbeat_fire_claim(
@@ -2878,18 +2881,17 @@ def run_one_job(
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        with self_removal_delivery_scope(job["id"]):
-            return _run_with_fire_claim_heartbeat(
+        return _run_with_fire_claim_heartbeat(
+            job,
+            lambda lost_ownership: _run_one_job_body(
                 job,
-                lambda lost_ownership: _run_one_job_body(
-                    job,
-                    adapters=adapters,
-                    loop=loop,
-                    verbose=verbose,
-                    extra_prompt=extra_prompt,
-                    claim_lost=lost_ownership,
-                    transport_cancel=cancel_event,
-                    execution_token=execution_token))
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                extra_prompt=extra_prompt,
+                claim_lost=lost_ownership,
+                transport_cancel=cancel_event,
+                execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
@@ -3018,9 +3020,6 @@ class _FireOwnership:
             return True
         if self.owner is None:
             return False
-        if self_removal_delivery_allowed(self.job["id"]):
-            # The run deleted its own record; there is no claim left to re-resolve.
-            return False
         # The heartbeat's latched miss is one sample, not the verdict (#113357): the store is
         # re-checked here, and a claim that still validates keeps the run's real outcome. The
         # owner-fenced mark_job_run / fire_claim_fence remain the authority for side effects.
@@ -3067,10 +3066,7 @@ def _save_compose_deliver(
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
-        # remove_job() already deleted this job's output dir; saving would re-create an orphan.
-        output_file = (
-            None if self_removal_delivery_allowed(job["id"])
-            else save_job_output(job["id"], output))
+        output_file = save_job_output(job["id"], output)
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
 
@@ -3453,10 +3449,7 @@ def _run_one_job_body(
             delivery_error, delivery_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
         try:
-            if (
-                not _consume_interrupted_flag(job["id"], execution_token)
-                and not self_removal_delivery_allowed(job["id"])  # no record left to mark
-            ):
+            if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner

@@ -408,12 +408,13 @@ cadence, or run a "cron librarian" job that reconciles the whole table
   (`local`, `all`, `telegram:<chat_id>`) are honored verbatim.
 - **A job may remove itself and still report.** The "watch for X, tell me
   once, then stop" pattern — a recurring job whose run calls
-  `cronjob(action="remove", job_id=<its own id>)` and then answers — delivers
-  that final response and records the run as `completed`; the job record and
-  its `cron/output/<job_id>/` directory are gone afterwards and the final run
-  is not written there. Deleting the record from *outside* the run (another
-  process, or a replacement job reusing the id) still discards the stale
-  run's output, as before.
+  `cronjob(action="remove", job_id=<its own id>)`, or runs
+  `hermes cron remove <its own id>` in its terminal, and then answers —
+  delivers that final response. The job stays listed until the run finishes;
+  then the job record and its `cron/output/<job_id>/` directory are gone.
+  Removing the job from *outside* the run (another process or another job's
+  run) deletes it at once and stops the run without delivering its output, as
+  before.
 
 Prefer prompts that update existing jobs (list first, then update by ID)
 over ones that create new jobs each run.

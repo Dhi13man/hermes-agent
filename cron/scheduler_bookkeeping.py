@@ -84,9 +84,7 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
-    # A run that removed its own record has nothing left to mark; the delivery above is its result.
-    marked = scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+    marked = scheduler.mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
         scheduler.finish_execution(
             execution_id, success=False,
