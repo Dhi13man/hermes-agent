@@ -370,7 +370,7 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
 
 def _run_claimed_job_with_mid_run_action(
     tmp_path, monkeypatch, mid_run, *, execution_id, stub_output=True, crash=None,
-    expect_result=True,
+    expect_result=True, final_response="D1 is promoting",
 ):
     """Fire a claimed job through run_one_job with a stubbed agent run that performs ``mid_run``
     on its own record inside the real per-run scope (the context its tools see), keeps working
@@ -388,7 +388,7 @@ def _run_claimed_job_with_mid_run_action(
         time.sleep(0.3)
         if crash is not None:
             raise crash
-        return True, "saved output", "D1 is promoting", None
+        return True, "saved output", final_response, None
 
     # A completed agent run hands its notice to the durable delivery queue; a gateway drain that
     # wins the race against the run's bookkeeping sends it through ``_deliver_result``. A crash
@@ -528,6 +528,26 @@ def test_run_removing_its_job_from_its_terminal_still_delivers(tmp_path, monkeyp
     delivered.assert_called_once()
     finished.assert_called_once_with(
         "cli-self-removal-execution", success=True, error=None, delivery_outcome="delivered")
+    with jobs.use_cron_store(tmp_path):
+        assert jobs.load_jobs() == []
+    assert list((tmp_path / "cron" / "output").glob("*")) == []
+
+
+def test_silent_run_removing_its_job_from_its_terminal_finishes_cleanly(tmp_path, monkeypatch):
+    """A cleanup run that removes its own job with `hermes cron remove` and answers [SILENT]
+    books a clean success with nothing delivered, never a discarded stale result."""
+    from cron import jobs
+
+    delivered, finished = _run_claimed_job_with_mid_run_action(
+        tmp_path, monkeypatch,
+        lambda _jobs, job: _hermes_cron_cli(tmp_path, "remove", job["id"], run_identity=True),
+        execution_id="cli-silent-self-removal-execution", stub_output=False,
+        final_response="[SILENT]")
+
+    delivered.assert_not_called()
+    finished.assert_called_once()
+    assert finished.call_args.kwargs["success"] is True
+    assert finished.call_args.kwargs["error"] is None
     with jobs.use_cron_store(tmp_path):
         assert jobs.load_jobs() == []
     assert list((tmp_path / "cron" / "output").glob("*")) == []
